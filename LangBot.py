@@ -397,37 +397,49 @@ class LanguageLearningBot:
         """Simple health check endpoint"""
         return web.Response(text="Bot is running!")
 
-    async def handle_webhook(self, request):
+    async def handle_webhook(self, request: web.Request) -> web.Response:
         """Handle incoming webhook updates"""
         try:
             update_data = await request.json()
             update = Update.de_json(update_data, self.application.bot)
-            await self.application.process_update(update)
+            
+            # Create application context
+            async with self.application:
+                await self.application.initialize()
+                await self.application.process_update(update)
+            
             return web.Response(text="OK")
         except Exception as e:
             logger.error(f"Error processing webhook update: {e}")
-            return web.Response(status=500, text="Error processing update")
+            return web.Response(status=500, text=str(e))
 
     async def setup_webhook(self, webhook_url: str):
         """Setup webhook for the bot"""
-        webhook_info = await self.application.bot.get_webhook_info()
-        
-        # Only set webhook if it's not already set to our URL
-        if webhook_info.url != webhook_url:
+        # Initialize the application
+        async with self.application:
+            await self.application.initialize()
             await self.application.bot.set_webhook(webhook_url)
             logger.info(f"Webhook set to {webhook_url}")
 
     async def run_app(self):
         """Run the web application with explicit port binding"""
-        runner = web.AppRunner(self.webapp)
-        await runner.setup()
-        site = web.TCPSite(runner, '0.0.0.0', Config.PORT)
-        await site.start()
-        logger.info(f"Web app started on port {Config.PORT}")
-        
-        # Log the webhook URL
-        if Config.WEBHOOK_URL:
-            logger.info(f"Webhook URL: {Config.WEBHOOK_URL}")
+        # Initialize the application first
+        async with self.application:
+            await self.application.initialize()
+            
+            # Set up and start web server
+            runner = web.AppRunner(self.webapp)
+            await runner.setup()
+            site = web.TCPSite(runner, '0.0.0.0', Config.PORT)
+            await site.start()
+            logger.info(f"Web app started on port {Config.PORT}")
+            
+            if Config.WEBHOOK_URL:
+                logger.info(f"Webhook URL: {Config.WEBHOOK_URL}")
+            
+            # Keep the application running
+            while True:
+                await asyncio.sleep(3600)  # Sleep for an hour and continue running
 
     async def get_user_state(self, user_id: int) -> UserState:
         """Get user state from cache or database"""
@@ -723,18 +735,25 @@ class LanguageLearningBot:
 
     async def cleanup(self):
         """Cleanup resources"""
-        await self.db.close()
+        try:
+            if hasattr(self, 'application'):
+                async with self.application:
+                    await self.application.bot.delete_webhook()
+            if hasattr(self, 'db'):
+                await self.db.close()
+        except Exception as e:
+            logger.error(f"Error during cleanup: {e}")
 
     def run(self) -> None:
         """Run the bot"""
         logger.info("Starting bot...")
         loop = asyncio.get_event_loop()
         
-        # Initialize storage and commands
-        loop.run_until_complete(self.init_storage())
-        loop.run_until_complete(self.setup_commands())
-        
         try:
+            # Initialize storage and commands
+            loop.run_until_complete(self.init_storage())
+            loop.run_until_complete(self.setup_commands())
+            
             # For local development
             if Config.ENVIRONMENT == "development":
                 self.application.run_polling()
@@ -743,14 +762,27 @@ class LanguageLearningBot:
                 if not Config.RENDER_EXTERNAL_URL:
                     raise ValueError("RENDER_EXTERNAL_URL environment variable is required in production")
                 
-                # Setup web app and webhook
-                loop.run_until_complete(self.run_app())
-                loop.run_until_complete(self.setup_webhook(Config.WEBHOOK_URL))
+                # Setup webhook and run the application
+                webhook_task = loop.create_task(self.setup_webhook(Config.WEBHOOK_URL))
+                app_task = loop.create_task(self.run_app())
                 
-                # Run forever
-                loop.run_forever()
+                try:
+                    # Run both tasks
+                    loop.run_until_complete(asyncio.gather(webhook_task, app_task))
+                except KeyboardInterrupt:
+                    pass
+                finally:
+                    # Cancel tasks
+                    webhook_task.cancel()
+                    app_task.cancel()
+                    try:
+                        loop.run_until_complete(webhook_task)
+                        loop.run_until_complete(app_task)
+                    except asyncio.CancelledError:
+                        pass
         finally:
             loop.run_until_complete(self.cleanup())
+            loop.close()
 
 def main():
     try:
