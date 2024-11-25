@@ -15,6 +15,7 @@ import traceback
 from enum import Enum
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import ASCENDING, DESCENDING
+from aiohttp import web
 
 load_dotenv()
 
@@ -34,6 +35,8 @@ class Config:
     TELEGRAM_TOKEN: str = os.getenv("TELEGRAM_TOKEN", "")
     CLAUDE_API_KEY: str = os.getenv("CLAUDE_API_KEY", "")
     MONGODB_URI: str = os.getenv("MONGODB_URI", "")
+    WEBHOOK_URL: str = os.getenv("WEBHOOK_URL", "")
+    ENVIRONMENT: str = os.getenv("ENVIRONMENT", "production")
     MAX_WORDS_PER_USER: int = 100
     TARGET_SENTENCES: int = 3
     WORDS_PER_SENTENCE: int = 2
@@ -42,8 +45,13 @@ class Config:
 
     @classmethod
     def validate_config(cls) -> None:
+        required_vars = ["TELEGRAM_TOKEN", "CLAUDE_API_KEY", "MONGODB_URI"]
+        
+        if cls.ENVIRONMENT != "development":
+            required_vars.append("WEBHOOK_URL")
+        
         missing_vars = [
-            var for var in ["TELEGRAM_TOKEN", "CLAUDE_API_KEY", "MONGODB_URI"]
+            var for var in required_vars
             if not getattr(cls, var)
         ]
         if missing_vars:
@@ -120,12 +128,10 @@ class MongoDBService:
 
         user_state = UserState(user_id)
         
-        # Reconstruct active_words with proper Language enum keys
         for lang in Language:
             words = user_data["active_words"].get(lang.value, [])
             user_state.active_words[lang] = set(words)
         
-        # Reconstruct stats
         stats_data = user_data["stats"]
         user_state.stats = UserStats(
             total_texts=stats_data["total_texts"],
@@ -299,6 +305,11 @@ class LanguageLearningBot:
         self.text_generator = TextGenerator(Config.CLAUDE_API_KEY)
         self.db = MongoDBService(Config.MONGODB_URI)
         self.user_states: Dict[int, UserState] = {}
+        
+        # Add web app
+        self.webapp = web.Application()
+        self.webapp.router.add_get("/", self.health_check)
+        self.webapp.router.add_post("/webhook", self.handle_webhook)
 
         # Register handlers
         self.application.add_handler(CommandHandler("start", self.start))
@@ -316,6 +327,98 @@ class LanguageLearningBot:
         ))
         self.application.add_error_handler(self.error_handler)
 
+    async def setup_commands(self):
+        """Set up bot commands in the menu"""
+        commands = [
+            BotCommand("text", "Get new practice text"),
+            BotCommand("translate", "Translate last text"),
+            BotCommand("explain", "Get grammatical explanation"),
+            BotCommand("stats", "Show learning statistics"),
+            BotCommand("words", "List saved words"),
+            BotCommand("language", "Change language"),
+            BotCommand("help", "Show help message")
+        ]
+        await self.application.bot.set_my_commands(commands)
+
+    async def handle_error(self, update: Update, error: Exception) -> None:
+        """Handle errors in updates"""
+        error_message = (
+            "❌ Sorry, something went wrong. Please try again later.\n"
+            "If the problem persists, contact the bot administrator."
+        )
+        
+        if isinstance(error, ValueError):
+            error_message = str(error)
+        
+        if update and update.effective_message:
+            await update.effective_message.reply_text(error_message)
+
+    async def error_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Global error handler for the bot"""
+        logger.error(f"Exception while handling an update: {context.error}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        
+        # Get the exception info
+        error = context.error
+        try:
+            raise error
+        except Exception as e:
+            await self.handle_error(update, e)
+
+        # Log the error to MongoDB
+        try:
+            error_data = {
+                "timestamp": datetime.now(),
+                "update_id": update.update_id if update else None,
+                "user_id": update.effective_user.id if update and update.effective_user else None,
+                "chat_id": update.effective_chat.id if update and update.effective_chat else None,
+                "error_type": type(error).__name__,
+                "error_message": str(error),
+                "traceback": traceback.format_exc()
+            }
+            
+            # Log error to MongoDB
+            await self.db.activity_log.insert_one({
+                **error_data,
+                "type": "error"
+            })
+            
+        except Exception as e:
+            logger.error(f"Failed to log error to database: {e}")
+            
+    async def health_check(self, request):
+        """Simple health check endpoint"""
+        return web.Response(text="Bot is running!")
+
+    async def handle_webhook(self, request):
+        """Handle incoming webhook updates"""
+        try:
+            update_data = await request.json()
+            update = Update.de_json(update_data, self.application.bot)
+            await self.application.process_update(update)
+            return web.Response(text="OK")
+        except Exception as e:
+            logger.error(f"Error processing webhook update: {e}")
+            return web.Response(status=500, text="Error processing update")
+
+    async def setup_webhook(self, webhook_url: str):
+        """Setup webhook for the bot"""
+        webhook_info = await self.application.bot.get_webhook_info()
+        
+        # Only set webhook if it's not already set to our URL
+        if webhook_info.url != webhook_url:
+            await self.application.bot.set_webhook(webhook_url)
+            logger.info(f"Webhook set to {webhook_url}")
+
+    async def run_app(self):
+        """Run the web application"""
+        port = int(os.environ.get("PORT", 8080))
+        runner = web.AppRunner(self.webapp)
+        await runner.setup()
+        site = web.TCPSite(runner, '0.0.0.0', port)
+        await site.start()
+        logger.info(f"Web app started on port {port}")
+
     async def get_user_state(self, user_id: int) -> UserState:
         """Get user state from cache or database"""
         if user_id not in self.user_states:
@@ -331,23 +434,12 @@ class LanguageLearningBot:
         await self.db.save_user_state(user_state)
         await self.db.log_activity(user_id, activity_type, text, language)
 
-    async def setup_commands(self):
-        """Set up bot commands in the menu"""
-        commands = [
-            BotCommand("text", "Get new practice text"),
-            BotCommand("translate", "Translate last text"),
-            BotCommand("explain", "Get grammatical explanation"),
-            BotCommand("stats", "Show learning statistics"),
-            BotCommand("words", "List saved words"),
-            BotCommand("language", "Change language"),
-            BotCommand("help", "Show help message")
-        ]
-        await self.application.bot.set_my_commands(commands)
-
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle /start command"""
         await self.show_help(update, context)
 
     async def show_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle /help command"""
         user_state = await self.get_user_state(update.effective_user.id)
         help_text = (
             f"🌍 Welcome to Language Learning Bot! (Current: {user_state.current_language.value.capitalize()})\n\n"
@@ -474,6 +566,7 @@ class LanguageLearningBot:
         )
 
     async def get_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Generate new text using saved words"""
         try:
             user_state = await self.get_user_state(update.effective_user.id)
             current_lang = user_state.current_language
@@ -508,6 +601,7 @@ class LanguageLearningBot:
             await self.handle_error(update, e)
 
     async def translate_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Translate the last generated text"""
         try:
             user_state = await self.get_user_state(update.effective_user.id)
             
@@ -538,6 +632,7 @@ class LanguageLearningBot:
             await self.handle_error(update, e)
 
     async def explain_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Provide grammatical explanation of the last text"""
         try:
             user_state = await self.get_user_state(update.effective_user.id)
             
@@ -568,6 +663,7 @@ class LanguageLearningBot:
             await self.handle_error(update, e)
 
     async def show_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Show user statistics"""
         user_state = await self.get_user_state(update.effective_user.id)
         stats = user_state.stats
         
@@ -590,6 +686,7 @@ class LanguageLearningBot:
         await update.message.reply_text("\n".join(stats_text))
 
     async def list_words(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """List active words for current language"""
         user_state = await self.get_user_state(update.effective_user.id)
         current_lang = user_state.current_language
         
@@ -605,26 +702,9 @@ class LanguageLearningBot:
         )
         
         await update.message.reply_text(response)
-
-    async def handle_error(self, update: Update, error: Exception) -> None:
-        error_message = (
-            "❌ Sorry, something went wrong. Please try again later.\n"
-            "If the problem persists, contact the bot administrator."
-        )
         
-        if isinstance(error, ValueError):
-            error_message = str(error)
-        
-        if update and update.effective_message:
-            await update.effective_message.reply_text(error_message)
-
-    async def error_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        logger.error(f"Exception while handling an update: {context.error}")
-        logger.error(f"Traceback: {traceback.format_exc()}")
-        await self.handle_error(update, context.error)
-
     async def init_storage(self) -> None:
-        """Initialize MongoDB indexes and load user states"""
+        """Initialize MongoDB indexes"""
         try:
             await self.db.init_indexes()
             logger.info("MongoDB indexes initialized")
@@ -638,13 +718,30 @@ class LanguageLearningBot:
     def run(self) -> None:
         """Run the bot"""
         logger.info("Starting bot...")
-        asyncio.get_event_loop().run_until_complete(self.init_storage())
-        asyncio.get_event_loop().run_until_complete(self.setup_commands())
+        loop = asyncio.get_event_loop()
+        
+        # Initialize storage and commands
+        loop.run_until_complete(self.init_storage())
+        loop.run_until_complete(self.setup_commands())
+        
         try:
-            self.application.run_polling()
+            # For local development
+            if os.environ.get("ENVIRONMENT") == "development":
+                self.application.run_polling()
+            # For production (Render)
+            else:
+                webhook_url = Config.WEBHOOK_URL
+                if not webhook_url:
+                    raise ValueError("WEBHOOK_URL environment variable is required in production")
+                
+                # Setup web app and webhook
+                loop.run_until_complete(self.run_app())
+                loop.run_until_complete(self.setup_webhook(webhook_url))
+                
+                # Run forever
+                loop.run_forever()
         finally:
-            # Ensure proper cleanup
-            asyncio.get_event_loop().run_until_complete(self.cleanup())
+            loop.run_until_complete(self.cleanup())
 
 def main():
     try:
