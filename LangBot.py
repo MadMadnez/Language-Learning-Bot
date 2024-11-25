@@ -35,8 +35,14 @@ class Config:
     TELEGRAM_TOKEN: str = os.getenv("TELEGRAM_TOKEN", "")
     CLAUDE_API_KEY: str = os.getenv("CLAUDE_API_KEY", "")
     MONGODB_URI: str = os.getenv("MONGODB_URI", "")
-    WEBHOOK_URL: str = os.getenv("WEBHOOK_URL", "")
+    PORT: int = int(os.getenv("PORT", "8080"))
     ENVIRONMENT: str = os.getenv("ENVIRONMENT", "production")
+    
+    # Construct webhook URL from Render environment variables
+    RENDER_EXTERNAL_URL: str = os.getenv("RENDER_EXTERNAL_URL", "")
+    WEBHOOK_PATH: str = "/webhook"
+    WEBHOOK_URL: str = f"{RENDER_EXTERNAL_URL}{WEBHOOK_PATH}" if RENDER_EXTERNAL_URL else ""
+
     MAX_WORDS_PER_USER: int = 100
     TARGET_SENTENCES: int = 3
     WORDS_PER_SENTENCE: int = 2
@@ -47,8 +53,9 @@ class Config:
     def validate_config(cls) -> None:
         required_vars = ["TELEGRAM_TOKEN", "CLAUDE_API_KEY", "MONGODB_URI"]
         
-        if cls.ENVIRONMENT != "development":
-            required_vars.append("WEBHOOK_URL")
+        # Only check RENDER_EXTERNAL_URL in production
+        if cls.ENVIRONMENT == "production":
+            required_vars.append("RENDER_EXTERNAL_URL")
         
         missing_vars = [
             var for var in required_vars
@@ -306,10 +313,10 @@ class LanguageLearningBot:
         self.db = MongoDBService(Config.MONGODB_URI)
         self.user_states: Dict[int, UserState] = {}
         
-        # Add web app
+        # Add web app with explicit port binding
         self.webapp = web.Application()
         self.webapp.router.add_get("/", self.health_check)
-        self.webapp.router.add_post("/webhook", self.handle_webhook)
+        self.webapp.router.add_post(Config.WEBHOOK_PATH, self.handle_webhook)
 
         # Register handlers
         self.application.add_handler(CommandHandler("start", self.start))
@@ -411,13 +418,16 @@ class LanguageLearningBot:
             logger.info(f"Webhook set to {webhook_url}")
 
     async def run_app(self):
-        """Run the web application"""
-        port = int(os.environ.get("PORT", 8080))
+        """Run the web application with explicit port binding"""
         runner = web.AppRunner(self.webapp)
         await runner.setup()
-        site = web.TCPSite(runner, '0.0.0.0', port)
+        site = web.TCPSite(runner, '0.0.0.0', Config.PORT)
         await site.start()
-        logger.info(f"Web app started on port {port}")
+        logger.info(f"Web app started on port {Config.PORT}")
+        
+        # Log the webhook URL
+        if Config.WEBHOOK_URL:
+            logger.info(f"Webhook URL: {Config.WEBHOOK_URL}")
 
     async def get_user_state(self, user_id: int) -> UserState:
         """Get user state from cache or database"""
@@ -726,17 +736,16 @@ class LanguageLearningBot:
         
         try:
             # For local development
-            if os.environ.get("ENVIRONMENT") == "development":
+            if Config.ENVIRONMENT == "development":
                 self.application.run_polling()
             # For production (Render)
             else:
-                webhook_url = Config.WEBHOOK_URL
-                if not webhook_url:
-                    raise ValueError("WEBHOOK_URL environment variable is required in production")
+                if not Config.RENDER_EXTERNAL_URL:
+                    raise ValueError("RENDER_EXTERNAL_URL environment variable is required in production")
                 
                 # Setup web app and webhook
                 loop.run_until_complete(self.run_app())
-                loop.run_until_complete(self.setup_webhook(webhook_url))
+                loop.run_until_complete(self.setup_webhook(Config.WEBHOOK_URL))
                 
                 # Run forever
                 loop.run_forever()
