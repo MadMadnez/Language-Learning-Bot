@@ -15,3 +15,5 @@ services:
         sync: false
       - key: ENVIRONMENT
         value: production
+      - key: PORT
+        value: 8080
