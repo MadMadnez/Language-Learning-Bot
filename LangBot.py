@@ -35,8 +35,8 @@ class Config:
     TELEGRAM_TOKEN: str = os.getenv("TELEGRAM_TOKEN", "")
     CLAUDE_API_KEY: str = os.getenv("CLAUDE_API_KEY", "")
     MONGODB_URI: str = os.getenv("MONGODB_URI", "")
-    PORT: int = int(os.getenv("PORT", "8080"))
     ENVIRONMENT: str = os.getenv("ENVIRONMENT", "production")
+    PORT: int = int(os.getenv("PORT", "10000"))
     
     # Construct webhook URL from Render environment variables
     RENDER_EXTERNAL_URL: str = os.getenv("RENDER_EXTERNAL_URL", "")
@@ -393,8 +393,8 @@ class LanguageLearningBot:
         except Exception as e:
             logger.error(f"Failed to log error to database: {e}")
             
-    async def health_check(self, request):
-        """Simple health check endpoint"""
+    async def health_check(self, request: web.Request) -> web.Response:
+        """Health check endpoint"""
         return web.Response(text="Bot is running!")
 
     async def handle_webhook(self, request: web.Request) -> web.Response:
@@ -402,17 +402,33 @@ class LanguageLearningBot:
         try:
             update_data = await request.json()
             update = Update.de_json(update_data, self.application.bot)
-            
-            # Create application context
-            async with self.application:
-                await self.application.initialize()
-                await self.application.process_update(update)
-            
+            await self.application.process_update(update)
             return web.Response(text="OK")
         except Exception as e:
             logger.error(f"Error processing webhook update: {e}")
             return web.Response(status=500, text=str(e))
-
+    
+    async def run_webhook(self):
+        """Run the application with webhook"""
+        # Initialize the application
+        await self.application.initialize()
+        
+        # Set up webhook
+        webhook_url = Config.WEBHOOK_URL
+        await self.application.bot.set_webhook(webhook_url)
+        logger.info(f"Webhook set to {webhook_url}")
+        
+        # Set up web application
+        port = int(os.environ.get("PORT", 10000))  # Render provides PORT env var
+        
+        runner = web.AppRunner(self.webapp)
+        await runner.setup()
+        site = web.TCPSite(runner, '0.0.0.0', port)
+        await site.start()
+        
+        logger.info(f"Web app started on port {port}")
+        logger.info(f"Webhook URL: {webhook_url}")
+    
     async def setup_webhook(self, webhook_url: str):
         """Setup webhook for the bot"""
         # Initialize the application
@@ -737,8 +753,8 @@ class LanguageLearningBot:
         """Cleanup resources"""
         try:
             if hasattr(self, 'application'):
-                async with self.application:
-                    await self.application.bot.delete_webhook()
+                await self.application.bot.delete_webhook()
+                await self.application.shutdown()
             if hasattr(self, 'db'):
                 await self.db.close()
         except Exception as e:
@@ -759,27 +775,13 @@ class LanguageLearningBot:
                 self.application.run_polling()
             # For production (Render)
             else:
-                if not Config.RENDER_EXTERNAL_URL:
-                    raise ValueError("RENDER_EXTERNAL_URL environment variable is required in production")
+                loop.run_until_complete(self.run_webhook())
+                # Keep the application running
+                loop.run_forever()
                 
-                # Setup webhook and run the application
-                webhook_task = loop.create_task(self.setup_webhook(Config.WEBHOOK_URL))
-                app_task = loop.create_task(self.run_app())
-                
-                try:
-                    # Run both tasks
-                    loop.run_until_complete(asyncio.gather(webhook_task, app_task))
-                except KeyboardInterrupt:
-                    pass
-                finally:
-                    # Cancel tasks
-                    webhook_task.cancel()
-                    app_task.cancel()
-                    try:
-                        loop.run_until_complete(webhook_task)
-                        loop.run_until_complete(app_task)
-                    except asyncio.CancelledError:
-                        pass
+        except Exception as e:
+            logger.error(f"Bot startup error: {e}")
+            raise
         finally:
             loop.run_until_complete(self.cleanup())
             loop.close()
