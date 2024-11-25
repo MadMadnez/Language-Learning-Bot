@@ -1,5 +1,6 @@
-python-telegram-bot==21.7
-anthropic==0.39.0
-python-dotenv==1.0.1
-motor==3.6.0
-pymongo==4.9.0
+python-telegram-bot
+motor
+pymongo
+python-dotenv
+anthropic
+aiohttp
