@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: language-learning-bot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: TELEGRAM_TOKEN
+        sync: false
+      - key: CLAUDE_API_KEY
+        sync: false
+      - key: MONGODB_URI
+        sync: false
+      - key: WEBHOOK_URL
+        sync: false
+      - key: ENVIRONMENT
+        value: production
